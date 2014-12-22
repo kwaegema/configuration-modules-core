@@ -19,6 +19,7 @@ use CAF::FileEditor;
 use LC::Exception qw(SUCCESS);
 use Set::Scalar;
 use File::Path qw(mkpath);
+use Text::Glob qw(match_glob);
 
 use constant REPOS_DIR => "/etc/yum.repos.d";
 use constant REPOS_TEMPLATE => "spma/repository.tt";
@@ -38,7 +39,7 @@ use constant YUM_DISTRO_SYNC => qw(yum -y distro-sync);
 use constant YUM_CONF_FILE => "/etc/yum.conf";
 use constant CLEANUP_ON_REMOVE => "clean_requirements_on_remove";
 use constant REPOQUERY => qw(repoquery --show-duplicates --envra);
-use constant YUM_COMPLETE_TRANSACTION => "yum-complete-transaction";
+use constant YUM_COMPLETE_TRANSACTION => qw(yum-complete-transaction -y);
 use constant OBSOLETE => "obsoletes";
 use constant REPO_DEPS => qw(repoquery --requires --resolve --plugins
                              --qf %{NAME};%{ARCH});
@@ -103,11 +104,11 @@ sub generate_reverse_proxy_urls
 
     my @l;
     foreach my $pt (@$prots) {
-	foreach my $px (@proxies) {
+        foreach my $px (@proxies) {
             my $url = $pt->{url};
-	    $url =~ s{^(.*?):(/+)[^/]+}{$1:$2$px};
-	    push(@l, { url => $url });
-	}
+            $url =~ s{^(.*?):(/+)[^/]+}{$1:$2$px};
+            push(@l, { url => $url });
+        }
     }
     return \@l;
 }
@@ -195,9 +196,9 @@ sub execute_yum_command
     my (%opts, $out, $err, @missing);
 
     %opts = ( log => $self,
-	      stdout => \$out,
-	      stderr => \$err,
-	      keeps_state => $keeps_state);
+          stdout => \$out,
+          stderr => \$err,
+          keeps_state => $keeps_state);
 
     $opts{stdin} = $stdin if defined($stdin);
 
@@ -215,7 +216,7 @@ sub execute_yum_command
         ($out && (@missing = ($out =~ m{^No package (.*) available}omg)))
         ) {
         $self->warn("Command output: $out");
-        $self->$error_logger("Failed $why: $err");
+        $self->$error_logger("Failed $why: ", $err || "(empty/undef stderr)");
         if (@missing) {
             $self->$error_logger("Missing packages: ", join(" ", @missing));
         }
@@ -235,8 +236,8 @@ sub schedule
 
     my @ls;
     foreach my $pkg (@$target) {
-	push(@ls, $pkg);
-	$ls[-1] =~ s{;}{.};
+        push(@ls, $pkg);
+        $ls[-1] =~ s{;}{.};
     }
     return  sprintf("%s %s\n", $op, join(" ", @ls));
 }
@@ -247,11 +248,11 @@ sub installed_pkgs
     my $self = shift;
 
     my $cmd = CAF::Process->new(RPM_QUERY, keeps_state => 1,
-				log => $self);
+                log => $self);
 
     my $out = $cmd->output();
     if ($?) {
-	return undef;
+        return undef;
     }
     # We don't consider gpg-pubkeys, which won't come from any
     # downloaded RPM, anyways.
@@ -288,18 +289,18 @@ sub wanted_pkgs
     my @pkl;
 
     while (my ($pkg, $st) = each(%$pkgs)) {
-	my ($name) = (unescape($pkg) =~ m{^([\w\.\-\+]+)[*?]?});
+        my ($name) = (unescape($pkg) =~ m{^([\w\.\-\+]+)[*?]?});
         if (!$name) {
             $self->error("Invalid package name: ", unescape($pkg));
             return undef;
         }
-	if (%$st) {
-	    while (my ($ver, $archs) = each(%$st)) {
-		push(@pkl, map("$name;$_", keys(%{$archs->{arch}})));
-	    }
-	} else {
-	    push(@pkl, $name);
-	}
+        if (%$st) {
+            while (my ($ver, $archs) = each(%$st)) {
+                push(@pkl, map("$name;$_", keys(%{$archs->{arch}})));
+            }
+        } else {
+            push(@pkl, $name);
+        }
     }
     return Set::Scalar->new(@pkl);
 }
@@ -378,40 +379,118 @@ sub prepare_lock_lists
     return ($locked, $toquery);
 }
 
+# generate a msg for logging purposes based on 
+# wanted_locked and not_matched (passed as ref here) 
+# The message can be long because it contains list of 
+# all packages and non-exact matched repoquery output
+# Lists are not comma separated so it can be copied 
+# and used on command line
+sub _make_msg_wanted_locked
+{ 
+    
+    my ($wanted_locked, $not_matched_ref) = @_;
+
+    return sprintf(
+        "%d wanted packages with wildcards: %s, ".
+        "%d non-exact matched packages from repoquery: %s",
+        $wanted_locked->size, join(" ", @$wanted_locked),
+        scalar @$not_matched_ref, join(" ", @$not_matched_ref)
+        );
+
+}
+
 # Returns whether the $locked string locks all the items in
 # $wanted_locked.  Warning: $wanted_locked will be modified!!
-#
-# TODO: report correctly when a globbed version is missing (say, no
-# python-2.7* could be locked)
+# ($locked is output from REPOQUERY).
+# When C<fullsearch> is true, the result will be checked 
+# for with glob pattern matching to verify the requested packages 
+# are in the $locked string. Otherwise, any requested package with
+# a wildcard will be assumed to have a match in the output. 
+# The main issue with fullsearch is that it is a possibly slow process. 
 sub locked_all_packages
 {
-    my ($self, $wanted_locked, $locked) = @_;
+    my ($self, $wanted_locked, $locked, $fullsearch) = @_;
 
-    # Ensure that all the packages that we wanted to lock have been
-    # resolved!!!
-    foreach my $pkg (split(/\n/, $locked)) {
-        my @envra = split(/:/, $pkg);
-        $wanted_locked->delete($envra[1]);
+    my @not_matched;
+    
+    # Process output and filter exact matches
+    foreach my $pkgstr (split(/\n/, $locked)) {
+        my @envra = split(/:/, $pkgstr);
+        my $pkg = $envra[1];
+        if ($wanted_locked->has($pkg)) {
+            $wanted_locked->delete($pkg);
+        } else {
+            # keep repoquery output of non-exact matched packages
+            # locked packages like kernel*-some.version will cause other 
+            # entries like kernel-devel in the repoquery output, which 
+            # will never match, so having packages in @not_locked. 
+            push(@not_matched, $pkg) if $pkg;
+        }
+    }
+    
+    # No wanted_locked packages left, everything matched
+    if (! @$wanted_locked) {
+        $self->verbose("All wanted_locked packages found (without any wildcard processing).");
+        return 1;
     }
 
-    if (grep($_ !~ m{[*?]}, @$wanted_locked)) {
-        $self->error("Unable to lock: $wanted_locked. ",
+    my $msg = _make_msg_wanted_locked($wanted_locked, \@not_matched);
+    if ($fullsearch) {
+        # At this point, all remaining entries in the wanted_locked 
+        # might have a wildcard in them.
+        # Brute-force could possibly lead to a very slow worst case scenario
+        # 
+        # Issue: single wildcard might match multiple lines of output, 
+        #   so always process all output
+        $self->verbose("Starting fullsearch on $msg.");
+        foreach my $wl (@$wanted_locked) {
+            # (try to) match @not_matched 
+            # TODO: remove the matches? can we assume that every 
+            #  match corresponds to exactly one wildcard? probably not.
+            #  e.g. a-*5 will match a-6.5, but also a-devel-6.5; so a-devel-*5 
+            #  would be left without (valid) match.
+            #  -> current implementation does not remove the matches.
+            $wanted_locked->delete($wl) if (grep(match_glob($wl, $_), @not_matched));
+        }
+
+        $msg = "wanted_locked packages found (with fullsearch wildcard processing)." .
+            "Finished fullsearch with " .
+            _make_msg_wanted_locked($wanted_locked, \@not_matched);
+        if (@$wanted_locked) {
+            $self->error("Not all $msg.");
+            return 0;
+        } else {
+            $self->verbose("All $msg.");
+            return 1;
+        }
+    } elsif (grep($_ !~ m{[*?]}, @$wanted_locked)) {
+        $self->error("Unable to lock all packages. ",
                      "These packages with these versions don't seem to exist ",
-                     "in any configured repositories");
+                     "in any configured repositories. $msg.");
         return 0;
+    } elsif (grep($_ =~ m{[*?]}, @$wanted_locked)) {
+        # actually, only wildcards in the versions
+        $self->info("Unsure if all wanted packages are avaialble ",
+                    "due to wildcard(s) in the names and/or versions, ",
+                    "continuing as if all is fine. ",
+                    "Turn on fullsearch option to resolve the wildcards ",
+                    "(but be aware of potential speed impact: $msg).");
+        return 1;
     }
+    
+    # how do we get here?
     return 1;
 }
 
 # Lock the versions of any packages that have them
 sub versionlock
 {
-    my ($self, $pkgs) = @_;
+    my ($self, $pkgs, $fullsearch) = @_;
 
     my ($locked, $toquery) = $self->prepare_lock_lists($pkgs);
     my $out = $self->execute_yum_command([REPOQUERY, @$toquery],
                                          "determining epochs", 1);
-    return 0 if !defined($out) || !$self->locked_all_packages($locked, $out);
+    return 0 if !defined($out) || !$self->locked_all_packages($locked, $out, $fullsearch);
 
 
     my $fh = CAF::FileWriter->new(YUM_PACKAGE_LIST, log => $self);
@@ -432,8 +511,8 @@ sub packages_to_remove
                                 log => $self)->output();
 
     if ($?) {
-	$self->error ("Unable to find leaf packages");
-	return;
+        $self->error ("Unable to find leaf packages");
+        return;
     }
 
     # The leaf set doesn't contain the header lines, which are just
@@ -444,10 +523,10 @@ sub packages_to_remove
 
     my $false_positives = Set::Scalar->new();
     foreach my $pkg (@$candidates) {
-	my $name = (split(/;/, $pkg))[0];
-	if ($wanted->has($name)) {
-	    $false_positives->insert($pkg);
-	}
+        my $name = (split(/;/, $pkg))[0];
+        if ($wanted->has($name)) {
+            $false_positives->insert($pkg);
+        }
     }
 
     return $candidates-$false_positives;
@@ -462,16 +541,16 @@ sub spare_deps_whatreq
     my @to_rm;
 
     foreach my $pk (@$rm) {
-	my $arg = $pk;
-	$arg =~ s{;}{.};
-	my $whatreqs = $self->execute_yum_command([REPO_WHATREQS, $arg],
-						  "determine what requires $pk", 1);
-	return 0 if !defined($whatreqs);
-	foreach my $wr (split("\n", $whatreqs)) {
-	    if ($install->has($wr)) {
-		push(@to_rm, $pk);
-	    }
-	}
+        my $arg = $pk;
+        $arg =~ s{;}{.};
+        my $whatreqs = $self->execute_yum_command([REPO_WHATREQS, $arg],
+                              "determine what requires $pk", 1);
+        return 0 if !defined($whatreqs);
+        foreach my $wr (split("\n", $whatreqs)) {
+            if ($install->has($wr)) {
+                push(@to_rm, $pk);
+            }
+        }
     }
 
     $rm->delete(@to_rm);
@@ -488,12 +567,12 @@ sub spare_deps_requires
     my (@pkgs);
 
     foreach my $pkg (@$install) {
-	$pkg =~ s{;}{.};
-	push(@pkgs, $pkg);
+        $pkg =~ s{;}{.};
+        push(@pkgs, $pkg);
     }
 
     my $deps = $self->execute_yum_command([REPO_DEPS, @pkgs],
-					  "dependencies of install candidates", 1);
+                      "dependencies of install candidates", 1);
 
     return 0 if !defined $deps;
 
@@ -526,10 +605,10 @@ sub spare_dependencies
     # things.
     if (scalar(@$rm) < SMALL_REMOVAL && scalar(@$install) > LARGE_INSTALL) {
         $self->debug(3, "Sparing dependencies in the whatreq path");
-	return $self->spare_deps_whatreq($rm, $install);
+        return $self->spare_deps_whatreq($rm, $install);
     } else {
         $self->debug(3, "Sparing dependencies in the requires path");
-	return $self->spare_deps_requires($rm, $install);
+        return $self->spare_deps_requires($rm, $install);
     }
 }
 
@@ -560,8 +639,8 @@ sub distrosync
     my ($self, $run) = @_;
 
     if (!$run) {
-	$self->info("Skipping yum distro-sync");
-	return 1;
+        $self->info("Skipping yum distro-sync");
+        return 1;
     }
 
     return $self->execute_yum_command([YUM_DISTRO_SYNC], "synchronisation with upstream");
@@ -570,7 +649,7 @@ sub distrosync
 # Updates the packages on the system.
 sub update_pkgs
 {
-    my ($self, $pkgs, $groups, $run, $allow_user_pkgs, $purge, $tx_error_is_warn) = @_;
+    my ($self, $pkgs, $groups, $run, $allow_user_pkgs, $purge, $tx_error_is_warn, $fullsearch) = @_;
 
     $self->complete_transaction() or return 0;
 
@@ -580,7 +659,7 @@ sub update_pkgs
         $self->expire_yum_caches() or return 0;
     }
 
-    $self->versionlock($pkgs) or return 0;
+    $self->versionlock($pkgs, $fullsearch) or return 0;
 
     $self->distrosync($run) or return 0;
 
@@ -600,10 +679,10 @@ sub update_pkgs
     $to_install = $wanted-$installed;
 
     if (!$allow_user_pkgs) {
-	$to_rm = $self->packages_to_remove($wanted);
-	defined($to_rm) or return 0;
-	$self->spare_dependencies($to_rm, $to_install);
-	$tx = $self->schedule(REMOVE, $to_rm);
+        $to_rm = $self->packages_to_remove($wanted);
+        defined($to_rm) or return 0;
+        $self->spare_dependencies($to_rm, $to_install);
+        $tx = $self->schedule(REMOVE, $to_rm);
     }
 
     $tx .= $self->schedule(INSTALL, $to_install);
@@ -619,42 +698,50 @@ sub update_pkgs
 # Updates the packages on the system.
 sub update_pkgs_retry
 {
-    my ($self, $pkgs, $groups, $run, $allow_user_pkgs, $purge, $retry_if_not_allow_user_pkgs) = @_;
+    my ($self, $pkgs, $groups, $run, $allow_user_pkgs, $purge, $retry_if_not_allow_user_pkgs, $fullsearch) = @_;
     
     # If an error is logged due to failed transaction, 
     # it might be retried and might succeed, but ncm-ncd will not allow 
     # any component that has spma as dependency (i.e. typically all others)
     # to run (becasue he initial attempt had an error)
     my $tx_error_is_warn = $retry_if_not_allow_user_pkgs && ! $allow_user_pkgs;
+
+    # Introduce shortcut to call update_pkgs with the same except 2 arguments 
+    my $update_pkgs = sub {
+        my ($allow_user_pkgs, $tx_error_is_warn) = @_;
+        return $self->update_pkgs($pkgs, $groups, $run, $allow_user_pkgs, 
+                                  $purge, $tx_error_is_warn, $fullsearch);
+    };
     
-    if($self->update_pkgs($pkgs, $groups, $run, $allow_user_pkgs, $purge, $tx_error_is_warn)) {
+    if(&$update_pkgs($allow_user_pkgs, $tx_error_is_warn)) {
         $self->verbose("update_pkgs ok");
     } else {
         if ($allow_user_pkgs) {
-            # tx_error_is_warn = 0 in this case, error is logged
-            $self->verbose(1, "update_pkgs failed, userpkgs=true");
+            # tx_error_is_warn = 0 in this case, error is already logged
+            $self->verbose("update_pkgs failed, userpkgs=true");
             return 0;
         } elsif ($retry_if_not_allow_user_pkgs) {
             # all tx failures are errors here
+            $tx_error_is_warn = 0;
+            
             $self->verbose("userpkgs_retry: 1st update_pkgs failed, going to retry with forced userpkgs=true"); 
-            if($self->update_pkgs($pkgs, $groups, $run, 1, $purge, 0)) {
+            $allow_user_pkgs = 1;
+            if(&$update_pkgs($allow_user_pkgs, $tx_error_is_warn)) {
                 $self->verbose("userpkgs_retry: 2nd update_pkgs with forced userpkgs=true ok, trying 3rd"); 
-                if($self->update_pkgs($pkgs, $groups, $run, 0, $purge, 0)) {
-                    # log ok
+                $allow_user_pkgs = 0;
+                if(&$update_pkgs($allow_user_pkgs, $tx_error_is_warn)) {
                     $self->verbose("userpkgs_retry: 3rd update_pkgs with userpkgs=false ok."); 
                 } else {
-                    # log failure in 3rd step
                     $self->error("userpkgs_retry: 3rd update_pkgs with userpkgs=false failed."); 
                     return 0;
                 };
             } else {
-                # log failure in 2nd step
                 $self->error("userpkgs_retry: 2nd update_pkgs with forced userpkgs=true failed."); 
                 return 0;
             };
         } else {
             # log failure, no retry enabled 
-            # tx_error_is_warn = 0 in this case, error is logged
+            # tx_error_is_warn = 0 in this case, error is already logged
             $self->verbose("update_pkgs failed, userpkgs=false, no retry enabled");
             return 0;
         }
@@ -673,11 +760,11 @@ sub configure_yum
     my $fh = CAF::FileEditor->new($cfgfile, log => $self);
 
     $fh->add_or_replace_lines(CLEANUP_ON_REMOVE,
-			      CLEANUP_ON_REMOVE. q{\s*=\s*1},
-			      "\n" . CLEANUP_ON_REMOVE . "=1\n", ENDING_OF_FILE);
+                  CLEANUP_ON_REMOVE. q{\s*=\s*1},
+                  "\n" . CLEANUP_ON_REMOVE . "=1\n", ENDING_OF_FILE);
     $fh->add_or_replace_lines(OBSOLETE,
-			      OBSOLETE . "\\s*=\\s*$obsolete",
-			      "\n".  OBSOLETE. "=$obsolete\n", ENDING_OF_FILE);
+                  OBSOLETE . "\\s*=\\s*$obsolete",
+                  "\n".  OBSOLETE. "=$obsolete\n", ENDING_OF_FILE);
     $fh->close();
 }
 
@@ -712,7 +799,8 @@ sub Configure
     $self->configure_yum(YUM_CONF_FILE, $t->{process_obsoletes});
 
     $self->update_pkgs_retry($pkgs, $groups, $t->{run}, 
-                             $t->{userpkgs}, $purge_caches, $t->{userpkgs_retry})
+                             $t->{userpkgs}, $purge_caches, $t->{userpkgs_retry},
+                             $t->{fullsearch})
         or return 0;
     return 1;
 }

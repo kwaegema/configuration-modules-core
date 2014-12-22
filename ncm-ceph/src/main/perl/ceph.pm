@@ -20,7 +20,7 @@ use warnings;
 
 no if $] >= 5.017011, warnings => 'experimental::smartmatch';
 use base qw(NCM::Component NCM::Component::Ceph::commands NCM::Component::Ceph::crushmap
-    NCM::Component::Ceph::daemon NCM::Component::Ceph::config );
+    NCM::Component::Ceph::daemon NCM::Component::Ceph::config NCM::Component::Ceph::compare );
 
 use LC::Exception;
 use LC::Find;
@@ -41,17 +41,25 @@ sub init_git {
     } # Access with my $gitr = Git::Repository->new( work_tree => $qdir );
 }
  
-#Make sure  a temporary directory is created for push and pulls
+# Make sure  a temporary directory is created for push and pulls
 sub init_qdepl {
     my ($self, $config, $cephusr) = @_;
     my $qdir = $cephusr->{homeDir} . '/ncm-ceph/';
     my $crushdir = $qdir . 'crushmap/' ;
-    make_path($qdir, $crushdir, {owner=>$cephusr->{uid}, group=>$cephusr->{gid}});
+    make_path($qdir, $crushdir, {owner=>$cephusr->{uid}, group=>$cephusr->{gid}, error => \my $err});
+    if (@$err) {
+        $self->error("make_path returned errors:");
+        for my $diag (@$err) {
+            my ($file, $message) = %$diag;
+            $self->error("file $file: $message");
+        }
+        return 0;
+    }
     $self->init_git($qdir);
     return $qdir; 
 }
    
-#Checks if cluster is configured on this node.
+# Checks if cluster is configured on this node.
 sub cluster_exists_check {
     my ($self, $cluster, $gvalues) = @_;
     # Check If something is not configured or there is no existing cluster 
@@ -82,15 +90,16 @@ sub cluster_exists_check {
         if (!-f "$cephusr->{homeDir}/$gvalues->{clname}.mon.keyring"){
             $self->run_ceph_deploy_command([@newcmd]);
         }
-        my @moncr = qw(/usr/bin/ceph-deploy mon create-initial);
-        $self->print_cmds([[@moncr]]);
+        $self->info("To create a new cluster, run this command");
+        my $moncr = $self->run_ceph_deploy_command([qw(mon create-initial)],'','',1);
+        $self->print_cmds([$moncr]);
         return 0;
     } else {
         return 1;
     }
 }
 
-#Fail if cluster not ready and no deploy hosts
+# Fail if cluster not ready and no deploy hosts
 sub cluster_ready_check {
     my ($self, $cluster, $is_deploy, $hostname) = @_;
    
@@ -99,7 +108,8 @@ sub cluster_ready_check {
             my @admin = ('admin', $hostname);
             $self->run_ceph_deploy_command(\@admin);
             if (!$self->run_ceph_command([qw(status)])) {
-                $self->error("Cannot connect to ceph cluster!"); #This should not happen
+                # This should not happen
+                $self->error("Cannot connect to ceph cluster!");
                 return 0;
             } else {
                 $self->debug(1,"Node ready to receive ceph-commands");
@@ -113,7 +123,7 @@ sub cluster_ready_check {
     return 1;
 }
 
-#Checks the fsid value of the ceph dump with quattor value
+# Checks the fsid value of the ceph dump with quattor value
 sub cluster_fsid_check {
     my ($self, $cluster, $clname) = @_;
     my $jstr = $self->run_ceph_command([qw(mon dump)]) or return 0;
@@ -130,7 +140,7 @@ sub cluster_fsid_check {
     }
 }
 
-#generate mon hosts
+# generate mon hosts
 sub gen_extra_config {
     my ($self, $cluster) = @_;
     my $config = $cluster->{config};
@@ -141,16 +151,6 @@ sub gen_extra_config {
     if (!$config->{osd_crush_update_on_start}) {
         $config->{osd_crush_update_on_start} = $cluster->{crushmap} ? 0 : 1 ;
     }
-    my @allhosts = @{$config->{mon_host}};
-    while(my ($host, $osd) = each(%{$cluster->{osdhosts}})) { 
-        push (@allhosts, $osd->{fqdn});
-    }
-    while(my ($host, $mds) = each(%{$cluster->{mdss}})) { 
-        push (@allhosts, $mds->{fqdn});
-    }
-    my @uniquehosts = keys %{{map {($_ => 1)} @allhosts}}; 
-    $cluster->{allhosts} = \@uniquehosts;
-                          
 }
 
 # Checks if the versions of ceph and ceph-deploy are compatible
@@ -187,7 +187,7 @@ sub do_prepare_cluster {
         $gvalues->{qtmp} = $qtmp;
         my $clexists = $self->cluster_exists_check($cluster, $gvalues);
         my $cfgfile = "$gvalues->{cephusr}->{homeDir}/$gvalues->{clname}.conf";
-        $self->write_config($cluster->{config}, $cfgfile) or return 0;
+        $self->write_new_config($cluster->{config}, $cfgfile) or return 0;
         if (!$clexists) {
             return 0;
         }   
@@ -200,25 +200,35 @@ sub do_prepare_cluster {
 # Main method for configuring the ceph cluster. 
 # use_cluster sets the active cluster
 # do_prepare_cluster checks the cluster_existence and prepares the cluster for ceph-deploy, 
-# and writes the config file from quattor (but does not install it)
-# do_config_actions checks the config from and distribuate the configfile to the hosts.
-# do_daemon_actions checks daemons and create/change/remove when needed.
+# and writes the config file for new clusters from quattor (but does not install it)
+# get_ceph_conf and get_quat_conf checks and build config hashes from the actual ceph and quattor config.
+# compare_conf checks the differences between the hashes and define the necessary actions to be taken
+# set_and_push_configs distributes the full config files per host
+# deploy_daemons create daemons when needed.
+# destroy_daemons destroys them, and
+# restart_daemons can restart the changed ones.
 # do_crush_actions builds and installs the crushmap
 sub do_configure {
-    my ($self, $cluster, $gvalues) = @_;
+    my ($self, $cluster, $gvalues) = @_; 
     $self->use_cluster($gvalues->{clname}) or return 0;
     $self->debug(1,"preparing cluster");
-    $self->do_prepare_cluster($cluster, $gvalues) or return 0; 
+    $self->do_prepare_cluster($cluster, $gvalues) or return 0;
     $self->debug(1,"checking configuration");
-    $self->do_config_actions($cluster, $gvalues) or return 0;
+    my ($ceph_conf, $mapping, $weights) = $self->get_ceph_conf($gvalues) or return 0;
+    my $quat_conf = $self->get_quat_conf($cluster) or return 0;
+    my $structures = $self->compare_conf($quat_conf, $ceph_conf, 
+        $mapping, $gvalues) or return 0; 
     $self->debug(1,"configuring daemons");
-    $self->do_daemon_actions($cluster, $gvalues) or return 0;
+    my $tinies = $self->set_and_push_configs($structures->{configs}, $gvalues) or return 0;  
+    $self->deploy_daemons($structures->{deployd}, $tinies, $gvalues, $mapping) or return 0;
     $self->debug(1,"configuring crushmap");
-    $self->do_crush_actions($cluster, $gvalues) or return 0; 
-    $self->debug(1,'Done');
-    return 1;
+    $self->do_crush_actions($cluster, $gvalues, $structures->{skip}, $weights, $mapping) or return 0;
+    $self->destroy_daemons($structures->{destroy}, $mapping) or return 0;
+    $self->restart_daemons($structures->{restartd});
+    return 1;  
+        
 }
-    
+ 
 
 sub Configure {
     my ($self, $config) = @_;
@@ -231,10 +241,12 @@ sub Configure {
     my $hostname = $netw->{hostname};
     $self->debug(5, "Running on host $hostname.");
     $self->check_versions($t->{ceph_version}, $t->{deploy_version}) or return 0;
+    $self->set_ssh_command($t->{ssh_multiplex});
 
     while (my ($clus, $cluster) = each(%{$t->{clusters}})) {
         my $is_deploy = $cluster->{deployhosts}->{$hostname} ? 1 : 0 ;
         
+        $self->{fsid} = $cluster->{config}->{fsid}; 
         my $gvalues = { 
             clname => $clus,
             hostname => $hostname,
@@ -242,10 +254,13 @@ sub Configure {
             cephusr => $cephusr,
             key_accept => $t->{key_accept} 
         }; 
-        $self->do_configure($cluster, $gvalues) or return 0;
+        if ($is_deploy) {
+            $self->do_configure($cluster, $gvalues) or return 0;
+        } else {
+            $self->info("No deployhost, aborting configuration");
+        }
         return 1;
     }
 }
-
 
 1; # Required for perl module!

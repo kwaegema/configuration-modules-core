@@ -6,7 +6,7 @@
   <artifactId>configuration-modules-core</artifactId>
   <packaging>pom</packaging>
 
-  <version>14.8.0-rc5-SNAPSHOT</version>
+  <version>14.10.1-SNAPSHOT</version>
 
   <name>Node Configuration Manager - components</name>
   <description>Modules configuring different services or portions of
@@ -106,6 +106,8 @@
     <module>ncm-cups</module>
     <module>ncm-puppet</module>
     <module>ncm-ceph</module>
+    <module>ncm-nss</module>
+    <module>ncm-opennebula</module>
   </modules>
 
   <build>
@@ -126,4 +128,3 @@
   </build>
 
 </project>
-
