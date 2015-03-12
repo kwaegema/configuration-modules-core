@@ -3,5 +3,5 @@ Base test for servers
 /etc/ecryptfs-servers.conf
 multiline
 ---
-keyserver=full.server.name
-pwdserver=other.server.name
+^keyserver=full.server.name$
+^pwdserver=other.server.name$
