@@ -8,5 +8,4 @@ prefix "/software/components/metaconfig/services/{/etc/ecryptfs-servers.conf}";
 "mode" = 0700;
 "owner" = "root";
 "group" = "root";
-"daemon" = "";
 "module" = "tiny";
